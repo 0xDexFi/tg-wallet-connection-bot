@@ -22,6 +22,11 @@ MAX_HOP1_WALLETS = 30
 MAX_HOP2_WALLETS = 15
 MAX_CONCURRENT_REQUESTS = 10
 
+# Spam/dust filtering thresholds
+MIN_SOL_THRESHOLD = 0.5  # Minimum SOL value to consider (~$100 at $200/SOL)
+MIN_INTERACTION_COUNT = 1  # Minimum number of meaningful interactions
+DUST_THRESHOLD = 0.001  # Below this is considered dust (spam)
+
 # Scoring weights
 SCORES = {
     "FUNDER": 100,

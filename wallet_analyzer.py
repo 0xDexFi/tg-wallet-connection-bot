@@ -20,6 +20,8 @@ from config import (
     HOP2_TRANSACTION_LIMIT,
     MAX_HOP1_WALLETS,
     MAX_HOP2_WALLETS,
+    MIN_SOL_THRESHOLD,
+    DUST_THRESHOLD,
 )
 
 
@@ -308,6 +310,79 @@ def find_common_counterparties(
     return len(target_counterparties & wallet_counterparties)
 
 
+def is_spam_connection(conn: WalletConnection) -> bool:
+    """
+    Check if a connection is likely spam/dust.
+
+    Spam indicators:
+    - Very small SOL amounts (dust attacks)
+    - Only received tiny amounts (airdrop spam)
+    - No meaningful interaction pattern
+    """
+    total_sol = conn.sent_sol + conn.received_sol
+
+    # If total SOL is below dust threshold, it's spam
+    if total_sol < DUST_THRESHOLD:
+        return True
+
+    # If only received tiny amount and never sent, likely airdrop spam
+    if conn.sent_count == 0 and conn.received_sol < MIN_SOL_THRESHOLD:
+        # Exception: if it's a fee payer, keep it
+        if not conn.is_fee_payer:
+            return True
+
+    # If only sent tiny amount and never received, could be spam
+    if conn.received_count == 0 and conn.sent_sol < DUST_THRESHOLD:
+        return True
+
+    return False
+
+
+def filter_spam_connections(
+    connections: dict[str, WalletConnection],
+    funder: str | None = None,
+) -> dict[str, WalletConnection]:
+    """
+    Filter out spam/dust connections while keeping important ones.
+
+    Always keeps:
+    - The funder (most important signal)
+    - Fee payers (important for Solana analysis)
+    - Bidirectional connections (strong signal)
+    - Connections with significant SOL value
+    """
+    filtered = {}
+
+    for addr, conn in connections.items():
+        # Always keep the funder
+        if funder and addr == funder:
+            filtered[addr] = conn
+            continue
+
+        # Always keep fee payers
+        if conn.is_fee_payer:
+            filtered[addr] = conn
+            continue
+
+        # Always keep bidirectional connections
+        if conn.is_bidirectional:
+            filtered[addr] = conn
+            continue
+
+        # Check if it meets the minimum threshold
+        total_sol = conn.sent_sol + conn.received_sol
+        if total_sol >= MIN_SOL_THRESHOLD:
+            filtered[addr] = conn
+            continue
+
+        # Check if it's not spam
+        if not is_spam_connection(conn):
+            filtered[addr] = conn
+            continue
+
+    return filtered
+
+
 async def analyze_hop2_wallet(
     wallet_addr: str,
     wallet_score: float,
@@ -335,6 +410,9 @@ async def analyze_hop2_wallet(
 
         # Check if this wallet shares the same funder
         hop1_funder = find_funder(transactions, wallet_addr)
+
+        # Filter out spam/dust from hop2 connections
+        hop2_connections = filter_spam_connections(hop2_connections, hop1_funder)
 
         for addr, conn in hop2_connections.items():
             conn.hop_level = 2
@@ -418,10 +496,11 @@ async def analyze_wallet(address: str) -> AnalysisResult:
             funder_of_funder = find_funder(funder_txs, funder)
             result.funder_of_funder = funder_of_funder
 
-            # Find other wallets funded by the same funder
+            # Find other wallets funded by the same funder (with minimum threshold)
             funder_connections = extract_wallet_interactions(funder_txs, funder)
             for addr, conn in funder_connections.items():
-                if conn.sent_count > 0 and conn.sent_sol > 0:
+                # Only include if sent meaningful amount (not dust)
+                if conn.sent_count > 0 and conn.sent_sol >= MIN_SOL_THRESHOLD:
                     if addr != address and not is_excluded_address(addr):
                         funder_siblings.append(addr)
 
@@ -432,6 +511,7 @@ async def analyze_wallet(address: str) -> AnalysisResult:
     # =========================================================================
     # PHASE 4: Score and filter direct connections
     # =========================================================================
+    # First filter out known programs/exchanges/etc
     filtered_addrs = filter_addresses(
         {addr: {"label": ""} for addr in connections.keys()}
     )
@@ -440,6 +520,9 @@ async def analyze_wallet(address: str) -> AnalysisResult:
         for addr in filtered_addrs.keys()
         if addr in connections
     }
+
+    # Then filter out spam/dust connections
+    filtered_connections = filter_spam_connections(filtered_connections, funder)
 
     # Score each connection
     for addr, conn in filtered_connections.items():
