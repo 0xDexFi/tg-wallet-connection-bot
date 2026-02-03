@@ -346,29 +346,36 @@ def is_spam_connection(conn: WalletConnection) -> bool:
 
     Spam indicators:
     - Very small total value (dust attacks)
-    - Only received tiny amounts (airdrop spam)
-    - No meaningful interaction pattern
+    - Only received (never sent) - likely airdrop spam
+    - No meaningful SOL/stablecoin transfer
     """
     total_sol = conn.sent_sol + conn.received_sol
     total_usd = conn.sent_usd + conn.received_usd
     total_value = get_total_usd_value(conn)
 
-    # If total value is below $1, it's spam
-    if total_value < 1.0:
+    # If total value is below $10, it's likely spam
+    if total_value < 10.0:
         return True
 
-    # If only received tiny amount (SOL or USD) and never sent, likely airdrop spam
-    if conn.sent_count == 0:
+    # AGGRESSIVE: If only RECEIVED and never SENT anything = airdrop spam
+    # Real connections involve two-way interaction or you sending to them
+    if conn.sent_count == 0 and conn.sent_sol == 0 and conn.sent_usd == 0:
+        # Only received from this address, never sent to them
         received_value = (conn.received_sol * 200.0) + conn.received_usd
-        if received_value < 100.0:  # Less than $100 received only
-            # Exception: if it's a fee payer, keep it
-            if not conn.is_fee_payer:
+        # Even if received a lot, if we never sent back, it's likely:
+        # - Airdrop spam
+        # - Random person sending
+        # - Marketing/gambling promo
+        # Exception: fee payers (they pay our fees)
+        if not conn.is_fee_payer:
+            # Require at least $500 received-only to consider (high bar)
+            if received_value < 500.0:
                 return True
 
-    # If only sent tiny amount and never received, could be spam
-    if conn.received_count == 0:
+    # If only sent tiny amount and never received = likely interacting with spam
+    if conn.received_count == 0 and conn.received_sol == 0 and conn.received_usd == 0:
         sent_value = (conn.sent_sol * 200.0) + conn.sent_usd
-        if sent_value < 1.0:  # Less than $1 sent
+        if sent_value < 50.0:  # Less than $50 sent one-way
             return True
 
     return False

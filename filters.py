@@ -177,6 +177,32 @@ BOT_ADDRESSES = {
     "JitoMEV1111111111111111111111111111111111111": "Jito MEV",
 }
 
+# ============================================================================
+# SPAM / AIRDROP MARKETING / GAMBLING
+# ============================================================================
+SPAM_ADDRESSES = {
+    # FlipGG - gambling spam
+    "FLiPggWYQyKVTULFWMQjAk26JfK5XRCajfyTmD1rqFP": "FlipGG",
+    "FLIP3fdEx5tiMQmAhZvHnfN3zMdKtfpAuBz5N5JKpump": "FlipGG",
+    "F1ipyyy2Z6kuvSvY6BPLnpwMYvUaCzMHAqBuTgyFpump": "FlipGG",
+    "FLiPGGzz82EovFYFBaVFLRphJBcZfeNUoQpRdkdJpump": "FlipGG",
+    # Add any address containing "flip" in various cases
+    # DustSweeper
+    "DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnLmz": "DustSweeper",
+    # Airdrop spam tokens
+    "AirBTCpump111111111111111111111111111111111": "Airdrop Spam",
+    # Solana spam bots
+    "SPAMzP6YeJiB1U6T4Q4VD2Y8QjXdK1H6HhQqhUfpump": "Spam Bot",
+    # Known marketing/spam wallets
+    "bonk4xPrXqBmkXvMmwXPBJCkPmzpBLQKRyVFjLpump": "Spam",
+}
+
+# Spam token mints to ignore
+SPAM_TOKEN_MINTS = {
+    "FLiPggWYQyKVTULFWMQjAk26JfK5XRCajfyTmD1rqFP": "FlipGG Token",
+    # Add more spam token mints here
+}
+
 # Combine all excluded addresses
 EXCLUDED_ADDRESSES = {
     **CEX_ADDRESSES,
@@ -186,6 +212,7 @@ EXCLUDED_ADDRESSES = {
     **SYSTEM_PROGRAMS,
     **BRIDGE_PROGRAMS,
     **BOT_ADDRESSES,
+    **SPAM_ADDRESSES,
 }
 
 # Patterns in labels that indicate exclusion
@@ -195,6 +222,20 @@ EXCLUDED_LABEL_PATTERNS = [
     "tensor", "magic eden", "metaplex", "pool", "lp ", "liquidity",
     "vault", "authority", "fee", "treasury", "program",
     "wormhole", "bridge", "swap", "amm", "dex",
+    # Spam patterns
+    "flip", "flipgg", "airdrop", "free", "claim", "bonus",
+    "casino", "gambling", "lottery", "giveaway", "dust",
+]
+
+# Address substrings that indicate spam (case insensitive check)
+SPAM_ADDRESS_PATTERNS = [
+    "flip",
+    "spam",
+    "dust",
+    "free",
+    "claim",
+    "bonus",
+    "pump",  # PumpFun tokens often spam
 ]
 
 # Known program ID prefixes (programs often start with these)
@@ -205,9 +246,22 @@ PROGRAM_PREFIXES = [
 ]
 
 
+def is_spam_address(address: str) -> bool:
+    """Check if address looks like spam based on patterns."""
+    addr_lower = address.lower()
+    for pattern in SPAM_ADDRESS_PATTERNS:
+        if pattern in addr_lower:
+            return True
+    return False
+
+
 def is_excluded_address(address: str) -> bool:
     """Check if address should be excluded from analysis."""
-    return address in EXCLUDED_ADDRESSES
+    if address in EXCLUDED_ADDRESSES:
+        return True
+    if is_spam_address(address):
+        return True
+    return False
 
 
 def get_exclusion_reason(address: str) -> str | None:

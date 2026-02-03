@@ -24,8 +24,9 @@ MAX_CONCURRENT_REQUESTS = 5  # Reduced to avoid rate limits
 
 # Spam/dust filtering thresholds
 MIN_SOL_THRESHOLD = 0.5  # Minimum SOL value to consider (~$100 at $200/SOL)
+MIN_USD_THRESHOLD = 100  # Minimum USD value to show connection
 MIN_INTERACTION_COUNT = 1  # Minimum number of meaningful interactions
-DUST_THRESHOLD = 0.001  # Below this is considered dust (spam)
+DUST_THRESHOLD = 0.01  # Below this is considered dust (spam) - increased from 0.001
 
 # Scoring weights
 SCORES = {
