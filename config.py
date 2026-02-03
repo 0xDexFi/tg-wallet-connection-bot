@@ -15,12 +15,12 @@ HELIUS_BASE_URL = "https://api.helius.xyz/v0"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 # Analysis settings
-TRANSACTION_LIMIT = 100
-HOP1_TRANSACTION_LIMIT = 100
-HOP2_TRANSACTION_LIMIT = 50
+TRANSACTION_LIMIT = 500  # Max transactions to fetch for target wallet
+HOP1_TRANSACTION_LIMIT = 500  # Increased for better coverage
+HOP2_TRANSACTION_LIMIT = 100  # Keep lower for hop2 (many wallets)
 MAX_HOP1_WALLETS = 30
 MAX_HOP2_WALLETS = 15
-MAX_CONCURRENT_REQUESTS = 10
+MAX_CONCURRENT_REQUESTS = 5  # Reduced to avoid rate limits
 
 # Spam/dust filtering thresholds
 MIN_SOL_THRESHOLD = 0.5  # Minimum SOL value to consider (~$100 at $200/SOL)

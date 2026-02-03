@@ -486,11 +486,11 @@ async def analyze_wallet(address: str) -> AnalysisResult:
     )
 
     # =========================================================================
-    # PHASE 1: Fetch target wallet transactions
+    # PHASE 1: Fetch target wallet transactions (with pagination)
     # =========================================================================
     try:
-        transactions = await helius_client.get_transaction_history(
-            address, limit=HOP1_TRANSACTION_LIMIT
+        transactions = await helius_client.get_all_transaction_history(
+            address, max_transactions=HOP1_TRANSACTION_LIMIT
         )
     except Exception as e:
         result.error = f"Failed to fetch transactions: {str(e)}"
@@ -529,8 +529,8 @@ async def analyze_wallet(address: str) -> AnalysisResult:
 
     if funder:
         try:
-            funder_txs = await helius_client.get_transaction_history(
-                funder, limit=50
+            funder_txs = await helius_client.get_all_transaction_history(
+                funder, max_transactions=200
             )
             funder_of_funder = find_funder(funder_txs, funder)
             result.funder_of_funder = funder_of_funder
