@@ -1,114 +1,169 @@
-"""Core wallet analysis logic for finding connected wallets."""
+"""
+Advanced wallet analysis engine with multi-heuristic scoring.
+Implements techniques from ZachXBT, Chainalysis, and Bubblemaps.
+"""
 
 import asyncio
 from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any
 from helius_client import helius_client
-from filters import filter_addresses, is_excluded_address
-from config import TRANSACTION_LIMIT, HOP2_TRANSACTION_LIMIT, MAX_HOP1_WALLETS
+from filters import (
+    filter_addresses,
+    is_excluded_address,
+    is_cex_address,
+    get_cex_name,
+)
+from config import (
+    SCORES,
+    HOP1_TRANSACTION_LIMIT,
+    HOP2_TRANSACTION_LIMIT,
+    MAX_HOP1_WALLETS,
+    MAX_HOP2_WALLETS,
+)
 
 
-def extract_counterparties(
-    transactions: list[dict], target_address: str
-) -> dict[str, dict]:
+@dataclass
+class WalletConnection:
+    """Represents a connection to another wallet with scoring details."""
+    address: str
+    score: float = 0.0
+    signals: list[str] = field(default_factory=list)
+
+    # Interaction data
+    sent_count: int = 0
+    received_count: int = 0
+    sent_sol: float = 0.0
+    received_sol: float = 0.0
+
+    # Timing data
+    first_interaction: int | None = None
+    last_interaction: int | None = None
+    active_hours: set = field(default_factory=set)
+
+    # Relationship data
+    is_funder: bool = False
+    is_fee_payer: bool = False
+    is_bidirectional: bool = False
+    common_counterparties: int = 0
+    cex_deposit_match: bool = False
+
+    # Hop tracking
+    hop_level: int = 1
+    connected_via: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AnalysisResult:
+    """Complete analysis result for a wallet."""
+    target_address: str
+    transaction_count: int
+    funder: str | None
+    funder_of_funder: str | None
+
+    # Connections by hop
+    direct_connections: list[WalletConnection] = field(default_factory=list)
+    hop2_connections: list[WalletConnection] = field(default_factory=list)
+
+    # Cluster analysis
+    same_funder_cluster: list[str] = field(default_factory=list)
+    bidirectional_cluster: list[str] = field(default_factory=list)
+
+    # Metadata
+    error: str | None = None
+
+
+def extract_wallet_interactions(
+    transactions: list[dict],
+    target_address: str,
+) -> dict[str, WalletConnection]:
     """
-    Extract counterparty addresses from transactions.
-
-    Args:
-        transactions: List of parsed Helius transactions
-        target_address: The address we're analyzing
-
-    Returns:
-        Dict mapping counterparty address -> interaction metadata
+    Extract all wallet interactions from transactions with detailed metadata.
     """
-    counterparties = defaultdict(lambda: {
-        "sent_count": 0,
-        "received_count": 0,
-        "sent_sol": 0.0,
-        "received_sol": 0.0,
-        "first_interaction": None,
-        "last_interaction": None,
-        "is_funder": False,
-    })
+    connections: dict[str, WalletConnection] = defaultdict(
+        lambda: WalletConnection(address="")
+    )
 
     for tx in transactions:
         timestamp = tx.get("timestamp", 0)
-        tx_type = tx.get("type", "UNKNOWN")
-        source = tx.get("source", "UNKNOWN")
+        fee_payer = tx.get("feePayer", "")
 
-        # Handle native transfers
-        native_transfers = tx.get("nativeTransfers", [])
-        for transfer in native_transfers:
+        # Track hour of activity for timing correlation
+        if timestamp:
+            hour = (timestamp // 3600) % 24
+
+        # Process native SOL transfers
+        for transfer in tx.get("nativeTransfers", []):
             from_addr = transfer.get("fromUserAccount", "")
             to_addr = transfer.get("toUserAccount", "")
-            amount = transfer.get("amount", 0) / 1e9  # Convert lamports to SOL
+            amount = transfer.get("amount", 0) / 1e9  # lamports to SOL
 
             if from_addr == target_address and to_addr and to_addr != target_address:
-                # Target sent to this address
-                cp = counterparties[to_addr]
-                cp["sent_count"] += 1
-                cp["sent_sol"] += amount
-                _update_timestamps(cp, timestamp)
+                conn = connections[to_addr]
+                conn.address = to_addr
+                conn.sent_count += 1
+                conn.sent_sol += amount
+                _update_timing(conn, timestamp, hour if timestamp else None)
 
             elif to_addr == target_address and from_addr and from_addr != target_address:
-                # Target received from this address
-                cp = counterparties[from_addr]
-                cp["received_count"] += 1
-                cp["received_sol"] += amount
-                _update_timestamps(cp, timestamp)
+                conn = connections[from_addr]
+                conn.address = from_addr
+                conn.received_count += 1
+                conn.received_sol += amount
+                _update_timing(conn, timestamp, hour if timestamp else None)
 
-        # Handle token transfers
-        token_transfers = tx.get("tokenTransfers", [])
-        for transfer in token_transfers:
+        # Process token transfers
+        for transfer in tx.get("tokenTransfers", []):
             from_addr = transfer.get("fromUserAccount", "")
             to_addr = transfer.get("toUserAccount", "")
 
             if from_addr == target_address and to_addr and to_addr != target_address:
-                cp = counterparties[to_addr]
-                cp["sent_count"] += 1
-                _update_timestamps(cp, timestamp)
+                conn = connections[to_addr]
+                conn.address = to_addr
+                conn.sent_count += 1
+                _update_timing(conn, timestamp, hour if timestamp else None)
 
             elif to_addr == target_address and from_addr and from_addr != target_address:
-                cp = counterparties[from_addr]
-                cp["received_count"] += 1
-                _update_timestamps(cp, timestamp)
+                conn = connections[from_addr]
+                conn.address = from_addr
+                conn.received_count += 1
+                _update_timing(conn, timestamp, hour if timestamp else None)
 
-        # Handle account data for other interaction types
-        account_data = tx.get("accountData", [])
-        for account in account_data:
-            addr = account.get("account", "")
-            if addr and addr != target_address:
-                # Just track interaction exists
-                cp = counterparties[addr]
-                _update_timestamps(cp, timestamp)
+        # Track fee payer relationships
+        if fee_payer and fee_payer != target_address:
+            conn = connections[fee_payer]
+            conn.address = fee_payer
+            conn.is_fee_payer = True
+            _update_timing(conn, timestamp, hour if timestamp else None)
 
-    return dict(counterparties)
+    # Mark bidirectional connections
+    for conn in connections.values():
+        if conn.sent_count > 0 and conn.received_count > 0:
+            conn.is_bidirectional = True
+
+    return dict(connections)
 
 
-def _update_timestamps(cp: dict, timestamp: int):
-    """Update first/last interaction timestamps."""
-    if cp["first_interaction"] is None or timestamp < cp["first_interaction"]:
-        cp["first_interaction"] = timestamp
-    if cp["last_interaction"] is None or timestamp > cp["last_interaction"]:
-        cp["last_interaction"] = timestamp
+def _update_timing(conn: WalletConnection, timestamp: int, hour: int | None):
+    """Update timing metadata for a connection."""
+    if timestamp:
+        if conn.first_interaction is None or timestamp < conn.first_interaction:
+            conn.first_interaction = timestamp
+        if conn.last_interaction is None or timestamp > conn.last_interaction:
+            conn.last_interaction = timestamp
+    if hour is not None:
+        conn.active_hours.add(hour)
 
 
 def find_funder(transactions: list[dict], target_address: str) -> str | None:
     """
     Find the wallet that first funded the target address.
-
-    Args:
-        transactions: List of parsed transactions (should be sorted by time)
-        target_address: The address we're analyzing
-
-    Returns:
-        Address of the funder, or None if not found
+    This is the strongest signal for wallet connection.
     """
-    # Sort by timestamp ascending to find earliest
     sorted_txs = sorted(transactions, key=lambda x: x.get("timestamp", float("inf")))
 
     for tx in sorted_txs:
-        native_transfers = tx.get("nativeTransfers", [])
-        for transfer in native_transfers:
+        for transfer in tx.get("nativeTransfers", []):
             to_addr = transfer.get("toUserAccount", "")
             from_addr = transfer.get("fromUserAccount", "")
             amount = transfer.get("amount", 0)
@@ -116,177 +171,385 @@ def find_funder(transactions: list[dict], target_address: str) -> str | None:
             if to_addr == target_address and from_addr and amount > 0:
                 if not is_excluded_address(from_addr):
                     return from_addr
-
     return None
 
 
-def score_connections(
-    counterparties: dict[str, dict],
-    funder: str | None = None
-) -> list[tuple[str, dict, float]]:
+def find_cex_deposits(transactions: list[dict], target_address: str) -> dict[str, list[str]]:
     """
-    Score and rank connections by likelihood of being same person.
-
-    Args:
-        counterparties: Dict of counterparty address -> metadata
-        funder: Address of the funder (if found)
-
-    Returns:
-        List of (address, metadata, score) tuples, sorted by score descending
+    Find CEX deposit addresses used by the target.
+    If another wallet uses the same deposit address = likely same owner.
     """
-    scored = []
+    cex_deposits: dict[str, list[str]] = defaultdict(list)
 
-    for addr, data in counterparties.items():
-        score = 0.0
+    for tx in transactions:
+        for transfer in tx.get("nativeTransfers", []):
+            from_addr = transfer.get("fromUserAccount", "")
+            to_addr = transfer.get("toUserAccount", "")
 
-        # Funder gets highest priority
-        if addr == funder:
-            score += 100.0
-            data["is_funder"] = True
+            if from_addr == target_address and to_addr:
+                cex_name = get_cex_name(to_addr)
+                if cex_name:
+                    cex_deposits[cex_name].append(to_addr)
 
-        # Frequent interactions
-        total_interactions = data["sent_count"] + data["received_count"]
-        score += min(total_interactions * 5, 30)  # Cap at 30 points
-
-        # Bidirectional transfers (both sent and received)
-        if data["sent_count"] > 0 and data["received_count"] > 0:
-            score += 20.0
-
-        # Significant SOL amounts
-        total_sol = data["sent_sol"] + data["received_sol"]
-        if total_sol > 10:
-            score += 15.0
-        elif total_sol > 1:
-            score += 10.0
-        elif total_sol > 0.1:
-            score += 5.0
-
-        # Round number transfers (suggests intentional, not fees)
-        if _has_round_transfers(data):
-            score += 10.0
-
-        scored.append((addr, data, score))
-
-    # Sort by score descending
-    scored.sort(key=lambda x: x[2], reverse=True)
-    return scored
+    return dict(cex_deposits)
 
 
-def _has_round_transfers(data: dict) -> bool:
-    """Check if transfers involve round numbers (suggests same person)."""
-    for amount in [data["sent_sol"], data["received_sol"]]:
+def calculate_timing_correlation(
+    conn: WalletConnection,
+    target_hours: set[int],
+) -> float:
+    """
+    Calculate timing correlation score.
+    Wallets active in the same hours are more likely same owner.
+    """
+    if not conn.active_hours or not target_hours:
+        return 0.0
+
+    overlap = len(conn.active_hours & target_hours)
+    total = len(conn.active_hours | target_hours)
+
+    if total == 0:
+        return 0.0
+
+    return overlap / total
+
+
+def has_round_amounts(conn: WalletConnection) -> bool:
+    """
+    Check if transfers involve round numbers.
+    Round number transfers suggest intentional/same-person transfers.
+    """
+    round_numbers = [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]
+
+    for amount in [conn.sent_sol, conn.received_sol]:
         if amount > 0:
-            # Check if close to a round number
-            for round_num in [0.1, 0.5, 1, 2, 5, 10, 25, 50, 100]:
-                if abs(amount - round_num) < 0.01:
+            for round_num in round_numbers:
+                if abs(amount - round_num) < 0.001:
                     return True
-                if abs(amount % round_num) < 0.01:
+                if round_num > 0 and abs(amount % round_num) < 0.001:
                     return True
     return False
 
 
-async def analyze_wallet(address: str) -> dict:
+def score_connection(
+    conn: WalletConnection,
+    funder: str | None,
+    target_hours: set[int],
+    target_counterparties: set[str],
+) -> float:
     """
-    Analyze a wallet to find potentially connected wallets.
-
-    Args:
-        address: Solana wallet address to analyze
-
-    Returns:
-        Dict containing analysis results
+    Calculate comprehensive score for a wallet connection.
+    Uses multiple heuristics weighted by signal strength.
     """
-    # Hop 1: Get direct connections
+    score = 0.0
+    signals = []
+
+    # FUNDER - Highest priority signal
+    if conn.address == funder:
+        score += SCORES["FUNDER"]
+        conn.is_funder = True
+        signals.append("FUNDER")
+
+    # FEE PAYER - Strong signal on Solana
+    if conn.is_fee_payer:
+        score += SCORES["FEE_PAYER"]
+        signals.append("FEE_PAYER")
+
+    # BIDIRECTIONAL - Two-way transfers indicate close relationship
+    if conn.is_bidirectional:
+        score += SCORES["BIDIRECTIONAL"]
+        signals.append("BIDIRECTIONAL")
+
+    # FREQUENCY - Multiple interactions
+    total_interactions = conn.sent_count + conn.received_count
+    if total_interactions >= 10:
+        score += SCORES["HIGH_FREQUENCY"]
+        signals.append("HIGH_FREQ")
+    elif total_interactions >= 5:
+        score += SCORES["MEDIUM_FREQUENCY"]
+        signals.append("MED_FREQ")
+
+    # ROUND AMOUNTS - Suggests intentional transfers
+    if has_round_amounts(conn):
+        score += SCORES["ROUND_AMOUNT"]
+        signals.append("ROUND_AMT")
+
+    # LARGE TRANSFERS - Significant amounts
+    total_sol = conn.sent_sol + conn.received_sol
+    if total_sol >= 10:
+        score += SCORES["LARGE_TRANSFER"]
+        signals.append("LARGE_XFER")
+
+    # TIMING CORRELATION
+    timing_score = calculate_timing_correlation(conn, target_hours)
+    if timing_score > 0.5:
+        score += SCORES["TIMING_CORRELATION"]
+        signals.append("TIMING")
+
+    # COMMON COUNTERPARTIES
+    # (This is calculated separately and added to the connection)
+    if conn.common_counterparties >= 5:
+        score += SCORES["COMMON_COUNTERPARTY_HIGH"]
+        signals.append("COMMON_CP_HIGH")
+    elif conn.common_counterparties >= 3:
+        score += SCORES["COMMON_COUNTERPARTY_MED"]
+        signals.append("COMMON_CP")
+
+    conn.score = score
+    conn.signals = signals
+    return score
+
+
+def find_common_counterparties(
+    target_counterparties: set[str],
+    wallet_counterparties: set[str],
+) -> int:
+    """Count common counterparties between two wallets."""
+    return len(target_counterparties & wallet_counterparties)
+
+
+async def analyze_hop2_wallet(
+    wallet_addr: str,
+    wallet_score: float,
+    target_address: str,
+    target_counterparties: set[str],
+    funder: str | None,
+) -> tuple[str, dict[str, WalletConnection]]:
+    """Analyze a hop-1 wallet's connections for hop-2 analysis."""
     try:
         transactions = await helius_client.get_transaction_history(
-            address, limit=TRANSACTION_LIMIT
+            wallet_addr,
+            limit=HOP2_TRANSACTION_LIMIT,
+        )
+        connections = extract_wallet_interactions(transactions, wallet_addr)
+        filtered = filter_addresses(
+            {addr: {"label": ""} for addr in connections.keys()}
+        )
+
+        # Keep only filtered connections
+        hop2_connections = {
+            addr: connections[addr]
+            for addr in filtered.keys()
+            if addr != target_address and addr in connections
+        }
+
+        # Check if this wallet shares the same funder
+        hop1_funder = find_funder(transactions, wallet_addr)
+
+        for addr, conn in hop2_connections.items():
+            conn.hop_level = 2
+            conn.connected_via = [wallet_addr]
+
+            # SAME FUNDER - Very strong signal
+            if funder and hop1_funder and funder == hop1_funder:
+                conn.score += SCORES["SAME_FUNDER"] * 0.5
+                conn.signals.append("SAME_FUNDER_VIA")
+
+            # Common counterparties with target
+            wallet_cp = set(connections.keys())
+            conn.common_counterparties = find_common_counterparties(
+                target_counterparties, wallet_cp
+            )
+
+        return wallet_addr, hop2_connections
+
+    except Exception:
+        return wallet_addr, {}
+
+
+async def analyze_wallet(address: str) -> AnalysisResult:
+    """
+    Comprehensive wallet analysis with multi-hop clustering.
+    """
+    result = AnalysisResult(
+        target_address=address,
+        transaction_count=0,
+        funder=None,
+        funder_of_funder=None,
+    )
+
+    # =========================================================================
+    # PHASE 1: Fetch target wallet transactions
+    # =========================================================================
+    try:
+        transactions = await helius_client.get_transaction_history(
+            address, limit=HOP1_TRANSACTION_LIMIT
         )
     except Exception as e:
-        return {"error": f"Failed to fetch transactions: {str(e)}"}
+        result.error = f"Failed to fetch transactions: {str(e)}"
+        return result
 
     if not transactions:
-        return {"error": "No transactions found for this address"}
+        result.error = "No transactions found for this address"
+        return result
 
-    # Extract counterparties
-    direct_connections = extract_counterparties(transactions, address)
+    result.transaction_count = len(transactions)
 
-    # Find funder
+    # =========================================================================
+    # PHASE 2: Extract direct connections
+    # =========================================================================
+    connections = extract_wallet_interactions(transactions, address)
+
+    # Find the funder (highest priority signal)
     funder = find_funder(transactions, address)
+    result.funder = funder
 
-    # Filter out excluded addresses
-    filtered_direct = filter_addresses(direct_connections)
+    # Get target's active hours for timing correlation
+    target_hours: set[int] = set()
+    for tx in transactions:
+        ts = tx.get("timestamp", 0)
+        if ts:
+            target_hours.add((ts // 3600) % 24)
 
-    # Score and rank direct connections
-    scored_direct = score_connections(filtered_direct, funder)
+    # Get target's counterparties for common counterparty analysis
+    target_counterparties = set(connections.keys())
 
-    # Take top connections for hop 2
-    top_direct = scored_direct[:MAX_HOP1_WALLETS]
+    # =========================================================================
+    # PHASE 3: Find funder's funder (for same-funder clustering)
+    # =========================================================================
+    funder_of_funder = None
+    funder_siblings: list[str] = []
 
-    # Hop 2: Analyze connections of top connections
-    hop2_connections = defaultdict(lambda: {
-        "connected_via": [],
-        "total_score": 0.0,
-    })
-
-    async def fetch_hop2(wallet_addr: str, wallet_score: float):
-        """Fetch and process hop 2 connections for a wallet."""
+    if funder:
         try:
-            hop2_txs = await helius_client.get_transaction_history(
-                wallet_addr, limit=HOP2_TRANSACTION_LIMIT
+            funder_txs = await helius_client.get_transaction_history(
+                funder, limit=50
             )
-            hop2_counterparties = extract_counterparties(hop2_txs, wallet_addr)
-            hop2_filtered = filter_addresses(hop2_counterparties)
+            funder_of_funder = find_funder(funder_txs, funder)
+            result.funder_of_funder = funder_of_funder
 
-            for addr, data in hop2_filtered.items():
-                if addr != address:  # Don't include target in hop2
-                    hop2_connections[addr]["connected_via"].append({
-                        "wallet": wallet_addr,
-                        "score": wallet_score,
-                    })
-                    # Add weighted score based on intermediate wallet's score
-                    hop2_connections[addr]["total_score"] += wallet_score * 0.3
+            # Find other wallets funded by the same funder
+            funder_connections = extract_wallet_interactions(funder_txs, funder)
+            for addr, conn in funder_connections.items():
+                if conn.sent_count > 0 and conn.sent_sol > 0:
+                    if addr != address and not is_excluded_address(addr):
+                        funder_siblings.append(addr)
+
+            result.same_funder_cluster = funder_siblings[:10]
         except Exception:
-            pass  # Silently skip failed hop2 fetches
+            pass
 
-    # Fetch hop 2 in parallel
-    tasks = [
-        fetch_hop2(addr, score)
-        for addr, _, score in top_direct
+    # =========================================================================
+    # PHASE 4: Score and filter direct connections
+    # =========================================================================
+    filtered_addrs = filter_addresses(
+        {addr: {"label": ""} for addr in connections.keys()}
+    )
+    filtered_connections = {
+        addr: connections[addr]
+        for addr in filtered_addrs.keys()
+        if addr in connections
+    }
+
+    # Score each connection
+    for addr, conn in filtered_connections.items():
+        # Check for same-funder relationship
+        if addr in funder_siblings:
+            conn.score += SCORES["SAME_FUNDER"]
+            conn.signals.append("SAME_FUNDER")
+
+        score_connection(conn, funder, target_hours, target_counterparties)
+
+    # Sort by score
+    scored_connections = sorted(
+        filtered_connections.values(),
+        key=lambda x: x.score,
+        reverse=True,
+    )
+
+    result.direct_connections = scored_connections[:MAX_HOP1_WALLETS]
+
+    # Track bidirectional cluster
+    result.bidirectional_cluster = [
+        conn.address for conn in scored_connections if conn.is_bidirectional
+    ][:10]
+
+    # =========================================================================
+    # PHASE 5: Hop-2 Analysis
+    # =========================================================================
+    top_wallets = [conn.address for conn in scored_connections[:MAX_HOP2_WALLETS]]
+
+    hop2_tasks = [
+        analyze_hop2_wallet(
+            wallet_addr,
+            filtered_connections.get(wallet_addr, WalletConnection(address=wallet_addr)).score,
+            address,
+            target_counterparties,
+            funder,
+        )
+        for wallet_addr in top_wallets
     ]
-    await asyncio.gather(*tasks)
 
-    # Remove direct connections from hop2 (they're already in hop1)
-    for addr, _, _ in scored_direct:
-        hop2_connections.pop(addr, None)
+    hop2_results = await asyncio.gather(*hop2_tasks, return_exceptions=True)
 
-    # Sort hop2 by total score
+    # Aggregate hop-2 connections
+    hop2_aggregated: dict[str, WalletConnection] = {}
+
+    for res in hop2_results:
+        if isinstance(res, Exception):
+            continue
+        via_wallet, hop2_conns = res
+        for addr, conn in hop2_conns.items():
+            if addr in filtered_connections:
+                continue  # Skip if already a direct connection
+
+            if addr not in hop2_aggregated:
+                hop2_aggregated[addr] = conn
+            else:
+                existing = hop2_aggregated[addr]
+                existing.score += conn.score * 0.5
+                existing.connected_via.extend(conn.connected_via)
+                existing.common_counterparties = max(
+                    existing.common_counterparties,
+                    conn.common_counterparties,
+                )
+
+    # Score and sort hop-2 connections
     sorted_hop2 = sorted(
-        hop2_connections.items(),
-        key=lambda x: x[1]["total_score"],
-        reverse=True
-    )[:20]  # Top 20 hop2 connections
+        hop2_aggregated.values(),
+        key=lambda x: x.score,
+        reverse=True,
+    )
+
+    result.hop2_connections = sorted_hop2[:20]
+
+    return result
+
+
+def format_analysis_result(result: AnalysisResult) -> dict:
+    """Convert analysis result to dictionary for JSON serialization."""
+    if result.error:
+        return {"error": result.error}
 
     return {
-        "address": address,
-        "transaction_count": len(transactions),
-        "funder": funder,
+        "address": result.target_address,
+        "transaction_count": result.transaction_count,
+        "funder": result.funder,
+        "funder_of_funder": result.funder_of_funder,
+        "same_funder_cluster": result.same_funder_cluster,
+        "bidirectional_cluster": result.bidirectional_cluster,
         "direct_connections": [
             {
-                "address": addr,
-                "score": score,
-                "is_funder": data.get("is_funder", False),
-                "sent_count": data["sent_count"],
-                "received_count": data["received_count"],
-                "sent_sol": round(data["sent_sol"], 4),
-                "received_sol": round(data["received_sol"], 4),
+                "address": conn.address,
+                "score": round(conn.score, 1),
+                "signals": conn.signals,
+                "is_funder": conn.is_funder,
+                "is_bidirectional": conn.is_bidirectional,
+                "sent_count": conn.sent_count,
+                "received_count": conn.received_count,
+                "sent_sol": round(conn.sent_sol, 4),
+                "received_sol": round(conn.received_sol, 4),
             }
-            for addr, data, score in scored_direct[:15]  # Top 15 direct
+            for conn in result.direct_connections
         ],
         "hop2_connections": [
             {
-                "address": addr,
-                "score": round(data["total_score"], 2),
-                "connected_via": data["connected_via"],
+                "address": conn.address,
+                "score": round(conn.score, 1),
+                "signals": conn.signals,
+                "connected_via": conn.connected_via[:3],
+                "common_counterparties": conn.common_counterparties,
             }
-            for addr, data in sorted_hop2[:10]  # Top 10 hop2
+            for conn in result.hop2_connections
         ],
     }
