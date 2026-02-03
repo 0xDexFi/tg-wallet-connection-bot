@@ -117,8 +117,16 @@ def format_results(results: dict) -> str:
                 details.append(f"sent {conn['sent_sol']} SOL")
             if conn.get("received_sol", 0) > 0:
                 details.append(f"recv {conn['received_sol']} SOL")
+            if conn.get("sent_usd", 0) > 0:
+                details.append(f"sent ${conn['sent_usd']}")
+            if conn.get("received_usd", 0) > 0:
+                details.append(f"recv ${conn['received_usd']}")
             if details:
-                lines.append(f"   📤 {', '.join(details)}")
+                lines.append(f"   💵 {', '.join(details)}")
+            # Show total value
+            total_val = conn.get("total_value_usd", 0)
+            if total_val > 0:
+                lines.append(f"   💰 Total: ~${total_val:,.0f}")
 
             lines.append("")
 

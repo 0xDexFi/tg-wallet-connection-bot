@@ -25,6 +25,15 @@ from config import (
 )
 
 
+# Known stablecoin mints (USDC, USDT, etc.)
+STABLECOIN_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT",
+    "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX": "USDH",
+    "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA": "USDS",
+}
+
+
 @dataclass
 class WalletConnection:
     """Represents a connection to another wallet with scoring details."""
@@ -37,6 +46,8 @@ class WalletConnection:
     received_count: int = 0
     sent_sol: float = 0.0
     received_sol: float = 0.0
+    sent_usd: float = 0.0  # USD value from stablecoins
+    received_usd: float = 0.0  # USD value from stablecoins
 
     # Timing data
     first_interaction: int | None = None
@@ -118,17 +129,26 @@ def extract_wallet_interactions(
         for transfer in tx.get("tokenTransfers", []):
             from_addr = transfer.get("fromUserAccount", "")
             to_addr = transfer.get("toUserAccount", "")
+            mint = transfer.get("mint", "")
+            token_amount = transfer.get("tokenAmount", 0)
+
+            # Calculate USD value for stablecoins (1:1 with USD)
+            usd_value = 0.0
+            if mint in STABLECOIN_MINTS:
+                usd_value = float(token_amount) if token_amount else 0.0
 
             if from_addr == target_address and to_addr and to_addr != target_address:
                 conn = connections[to_addr]
                 conn.address = to_addr
                 conn.sent_count += 1
+                conn.sent_usd += usd_value
                 _update_timing(conn, timestamp, hour if timestamp else None)
 
             elif to_addr == target_address and from_addr and from_addr != target_address:
                 conn = connections[from_addr]
                 conn.address = from_addr
                 conn.received_count += 1
+                conn.received_usd += usd_value
                 _update_timing(conn, timestamp, hour if timestamp else None)
 
         # Track fee payer relationships
@@ -310,30 +330,46 @@ def find_common_counterparties(
     return len(target_counterparties & wallet_counterparties)
 
 
+def get_total_usd_value(conn: WalletConnection, sol_price: float = 200.0) -> float:
+    """
+    Calculate total USD value of a connection.
+    Includes SOL (converted at given price) + stablecoin transfers.
+    """
+    sol_value = (conn.sent_sol + conn.received_sol) * sol_price
+    stable_value = conn.sent_usd + conn.received_usd
+    return sol_value + stable_value
+
+
 def is_spam_connection(conn: WalletConnection) -> bool:
     """
     Check if a connection is likely spam/dust.
 
     Spam indicators:
-    - Very small SOL amounts (dust attacks)
+    - Very small total value (dust attacks)
     - Only received tiny amounts (airdrop spam)
     - No meaningful interaction pattern
     """
     total_sol = conn.sent_sol + conn.received_sol
+    total_usd = conn.sent_usd + conn.received_usd
+    total_value = get_total_usd_value(conn)
 
-    # If total SOL is below dust threshold, it's spam
-    if total_sol < DUST_THRESHOLD:
+    # If total value is below $1, it's spam
+    if total_value < 1.0:
         return True
 
-    # If only received tiny amount and never sent, likely airdrop spam
-    if conn.sent_count == 0 and conn.received_sol < MIN_SOL_THRESHOLD:
-        # Exception: if it's a fee payer, keep it
-        if not conn.is_fee_payer:
-            return True
+    # If only received tiny amount (SOL or USD) and never sent, likely airdrop spam
+    if conn.sent_count == 0:
+        received_value = (conn.received_sol * 200.0) + conn.received_usd
+        if received_value < 100.0:  # Less than $100 received only
+            # Exception: if it's a fee payer, keep it
+            if not conn.is_fee_payer:
+                return True
 
     # If only sent tiny amount and never received, could be spam
-    if conn.received_count == 0 and conn.sent_sol < DUST_THRESHOLD:
-        return True
+    if conn.received_count == 0:
+        sent_value = (conn.sent_sol * 200.0) + conn.sent_usd
+        if sent_value < 1.0:  # Less than $1 sent
+            return True
 
     return False
 
@@ -341,6 +377,7 @@ def is_spam_connection(conn: WalletConnection) -> bool:
 def filter_spam_connections(
     connections: dict[str, WalletConnection],
     funder: str | None = None,
+    min_usd_value: float = 100.0,  # $100 minimum
 ) -> dict[str, WalletConnection]:
     """
     Filter out spam/dust connections while keeping important ones.
@@ -349,7 +386,7 @@ def filter_spam_connections(
     - The funder (most important signal)
     - Fee payers (important for Solana analysis)
     - Bidirectional connections (strong signal)
-    - Connections with significant SOL value
+    - Connections with significant value (SOL + stablecoins >= $100)
     """
     filtered = {}
 
@@ -369,16 +406,18 @@ def filter_spam_connections(
             filtered[addr] = conn
             continue
 
-        # Check if it meets the minimum threshold
-        total_sol = conn.sent_sol + conn.received_sol
-        if total_sol >= MIN_SOL_THRESHOLD:
+        # Check if it meets the minimum USD value threshold
+        total_value = get_total_usd_value(conn)
+        if total_value >= min_usd_value:
             filtered[addr] = conn
             continue
 
-        # Check if it's not spam
+        # Check if it's not spam (for edge cases)
         if not is_spam_connection(conn):
-            filtered[addr] = conn
-            continue
+            # Even if not spam, still require some minimum value
+            if total_value >= 10.0:  # At least $10
+                filtered[addr] = conn
+                continue
 
     return filtered
 
@@ -622,6 +661,9 @@ def format_analysis_result(result: AnalysisResult) -> dict:
                 "received_count": conn.received_count,
                 "sent_sol": round(conn.sent_sol, 4),
                 "received_sol": round(conn.received_sol, 4),
+                "sent_usd": round(conn.sent_usd, 2),
+                "received_usd": round(conn.received_usd, 2),
+                "total_value_usd": round(get_total_usd_value(conn), 2),
             }
             for conn in result.direct_connections
         ],
